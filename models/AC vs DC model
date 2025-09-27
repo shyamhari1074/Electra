@@ -1,0 +1,185 @@
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+
+np.random.seed(42)
+
+# -------------------- Data Generation --------------------
+n_samples = 2000
+start_date = datetime(2024, 1, 1)
+dates = pd.date_range(start=start_date, periods=n_samples, freq='30min')
+
+hour = dates.hour
+day_of_week = dates.dayofweek
+month = dates.month
+is_weekend = (day_of_week >= 5).astype(int)
+
+base_soc = 30 + 40 * np.sin(2 * np.pi * hour / 24) + np.random.normal(0, 10, n_samples)
+battery_soc = np.clip(base_soc, 5, 95)
+
+trip_distance = np.random.exponential(25, n_samples)
+trip_distance = np.clip(trip_distance, 2, 200)
+
+location_types = ['Home', 'Work', 'Shopping', 'Highway', 'Public']
+location_weights = [0.4, 0.25, 0.15, 0.1, 0.1]
+location = np.random.choice(location_types, n_samples, p=location_weights)
+
+time_urgency = np.random.uniform(1, 10, n_samples)
+time_urgency[(hour >= 7) & (hour <= 9)] += 3
+time_urgency[(hour >= 17) & (hour <= 19)] += 3
+time_urgency[trip_distance > 100] += 4
+time_urgency = np.clip(time_urgency, 1, 10)
+
+available_time = np.random.uniform(15, 480, n_samples)
+available_time[location == 'Home'] = np.random.uniform(240, 600, sum(location == 'Home'))
+available_time[location == 'Highway'] = np.random.uniform(15, 60, sum(location == 'Highway'))
+
+cost_sensitivity = np.random.uniform(1, 10, n_samples)
+temperature = 15 + 10 * np.sin(2 * np.pi * (dates.dayofyear - 80) / 365) + np.random.normal(0, 5, n_samples)
+
+charging_type = []
+for i in range(n_samples):
+    dc_score = 0
+    if battery_soc[i] < 20: dc_score += 4
+    elif battery_soc[i] < 40: dc_score += 2
+    if time_urgency[i] > 7: dc_score += 3
+    elif time_urgency[i] > 5: dc_score += 1
+    if trip_distance[i] > 100: dc_score += 3
+    elif trip_distance[i] > 50: dc_score += 1
+    if location[i] == 'Highway': dc_score += 4
+    elif location[i] == 'Public': dc_score += 2
+    elif location[i] == 'Home': dc_score -= 2
+    if available_time[i] < 60: dc_score += 3
+    elif available_time[i] < 120: dc_score += 1
+    if cost_sensitivity[i] > 7: dc_score -= 2
+    elif cost_sensitivity[i] > 5: dc_score -= 1
+    dc_score += np.random.normal(0, 1)
+    charging_type.append('DC' if dc_score > 2 else 'AC')
+
+ev_data = pd.DataFrame({
+    'timestamp': dates,
+    'hour': hour,
+    'day_of_week': day_of_week,
+    'is_weekend': is_weekend,
+    'month': month,
+    'battery_soc': np.round(battery_soc, 1),
+    'trip_distance_km': np.round(trip_distance, 1),
+    'location': location,
+    'time_urgency': np.round(time_urgency, 1),
+    'available_time_min': np.round(available_time, 0),
+    'cost_sensitivity': np.round(cost_sensitivity, 1),
+    'temperature_c': np.round(temperature, 1),
+    'charging_type': charging_type
+})
+
+print(f"Dataset shape: {ev_data.shape}")
+print(ev_data.head())
+
+# -------------------- Model Training --------------------
+le_location = LabelEncoder()
+ev_data['location_encoded'] = le_location.fit_transform(ev_data['location'])
+
+feature_columns = ['hour', 'day_of_week', 'is_weekend', 'battery_soc', 'trip_distance_km',
+                  'location_encoded', 'time_urgency', 'available_time_min',
+                  'cost_sensitivity', 'temperature_c']
+
+X = ev_data[feature_columns]
+y = ev_data['charging_type']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+rf_model = RandomForestClassifier(n_estimators=100, random_state=42, max_depth=10)
+rf_model.fit(X_train, y_train)
+
+y_pred = rf_model.predict(X_test)
+accuracy = accuracy_score(y_test, y_pred)
+
+print("\n🔋 EV CHARGING PREDICTION MODEL RESULTS 🔋")
+print(f"Model Accuracy: {accuracy:.3f}")
+print(classification_report(y_test, y_pred))
+
+# -------------------- Prediction Function --------------------
+def predict_charging_type(hour, day_of_week, is_weekend, battery_soc, trip_distance_km,
+                         location, time_urgency, available_time_min, cost_sensitivity, temperature_c):
+    location_encoded = le_location.transform([location])[0]
+    features = np.array([[hour, day_of_week, is_weekend, battery_soc, trip_distance_km,
+                         location_encoded, time_urgency, available_time_min,
+                         cost_sensitivity, temperature_c]])
+    prediction = rf_model.predict(features)[0]
+    probability = rf_model.predict_proba(features)[0]
+    pred_prob = probability[0] if prediction == 'AC' else probability[1]
+    return prediction, pred_prob
+
+# -------------------- Smart Notification System --------------------
+class EVChargingNotificationSystem:
+    def __init__(self, model, location_encoder):
+        self.model = model
+        self.location_encoder = location_encoder
+        self.user_patterns = {}
+
+    def learn_user_pattern(self, user_id, schedule_data):
+        self.user_patterns[user_id] = schedule_data
+
+    def get_smart_recommendation(self, user_id, current_day, battery_soc,
+                               upcoming_trip_distance=None, temperature=20):
+        if user_id not in self.user_patterns:
+            return "No user pattern found."
+
+        day_pattern = next((p for p in self.user_patterns[user_id] if p['day'] == current_day), None)
+        if not day_pattern:
+            return "No pattern found for this day"
+
+        current_hour = datetime.now().hour
+        location = day_pattern['location']
+        work_hours = day_pattern.get('work_hours', 8)
+
+        if location == 'Home': 
+            time_urgency, available_time = 2, 480
+        elif location == 'Work': 
+            time_urgency, available_time = 6, work_hours * 60
+        else: 
+            time_urgency, available_time = 5, 240
+
+        if upcoming_trip_distance and upcoming_trip_distance > 50:
+            time_urgency += 3
+
+        trip_distance = upcoming_trip_distance or day_pattern.get('typical_trip', 25)
+        is_weekend = 1 if current_day in ['Saturday', 'Sunday'] else 0
+        day_of_week = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday'].index(current_day)
+        cost_sensitivity = 8 if location == 'Home' else 5
+
+        prediction, confidence = predict_charging_type(
+            hour=current_hour, day_of_week=day_of_week, is_weekend=is_weekend,
+            battery_soc=battery_soc, trip_distance_km=trip_distance,
+            location=location, time_urgency=time_urgency,
+            available_time_min=available_time, cost_sensitivity=cost_sensitivity,
+            temperature_c=temperature
+        )
+
+        return {
+            'recommendation': prediction,
+            'confidence': confidence
+        }
+
+# Example usage
+user_schedule = [
+    {'day': 'Monday', 'location': 'Work', 'work_hours': 8, 'typical_trip': 45},
+    {'day': 'Tuesday', 'location': 'Work', 'work_hours': 8, 'typical_trip': 45},
+    {'day': 'Wednesday', 'location': 'Work', 'work_hours': 8, 'typical_trip': 45},
+    {'day': 'Thursday', 'location': 'Home', 'work_hours': 8, 'typical_trip': 15},
+    {'day': 'Friday', 'location': 'Home', 'work_hours': 8, 'typical_trip': 15},
+    {'day': 'Saturday', 'location': 'Home', 'work_hours': 0, 'typical_trip': 30},
+    {'day': 'Sunday', 'location': 'Home', 'work_hours': 0, 'typical_trip': 20}
+]
+
+notification_system = EVChargingNotificationSystem(rf_model, le_location)
+notification_system.learn_user_pattern('user_001', user_schedule)
+
+recommendation = notification_system.get_smart_recommendation(
+    user_id='user_001', current_day='Monday', battery_soc=35, upcoming_trip_distance=80, temperature=22
+)
+print("\n📱 SMART NOTIFICATION:", recommendation)
